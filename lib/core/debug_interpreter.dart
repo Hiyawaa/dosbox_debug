@@ -1,544 +1,376 @@
 // lib/core/debug_interpreter.dart
-// Interprets DEBUG.EXE-style commands and produces output strings.
+//
+// Public API for the DEBUG.EXE emulator layer.
+// debug_state.dart depends only on this file.
 
-import 'cpu8086.dart';
-import 'disassembler.dart';
-import 'assembler.dart';
-import 'executor.dart';
+import '../debug_exe/dbg_commands.dart';
+import '../debug_exe/dbg_cpu.dart';
 
-enum DebugMode { normal, assembling }
+// ---------------------------------------------------------------------------
+// DebugMode
+// ---------------------------------------------------------------------------
+enum DebugMode {
+  /// Normal "-" prompt: user types commands (D, U, T, G, R, …)
+  command,
 
+  /// After "A [addr]": each line is assembled as one instruction
+  assembling,
+
+  /// After "R <regname>": next line is the new hex register value
+  register,
+
+  /// After "R F": next line is space-separated flag-mnemonic toggles
+  flags,
+}
+
+// ---------------------------------------------------------------------------
+// DebugInterpreter
+// ---------------------------------------------------------------------------
 class DebugInterpreter {
-  final CPU8086 cpu;
-  late final Disassembler _dis;
-  late final MiniAssembler _asm;
-  late final Executor _exec;
+  final DbgSession session;
 
-  DebugMode mode = DebugMode.normal;
+  DebugMode _mode = DebugMode.command;
   int _assembleAddr = 0;
-  int _lastDumpAddr = 0x0100;
-  int _lastDisasmAddr = 0x0100;
+  String _pendingReg = '';
 
-  // For 'E' interactive entry mode
-  bool _enterMode = false;
-  int _enterAddr = 0;
+  /// [context] accepted but ignored — lets callers do DebugInterpreter(this).
+  DebugInterpreter([dynamic context]) : session = DbgSession();
 
-  DebugInterpreter(this.cpu) {
-    _dis  = Disassembler(cpu);
-    _asm  = MiniAssembler();
-    _exec = Executor(cpu);
+  // ---- Mode ----------------------------------------------------------------
+
+  DebugMode get mode => _mode;
+
+  // ---- CPU read-only accessors ---------------------------------------------
+
+  DbgCpu get cpu => session.cpu;
+
+  int get ax => session.cpu.ax;
+  int get bx => session.cpu.bx;
+  int get cx => session.cpu.cx;
+  int get dx => session.cpu.dx;
+  int get si => session.cpu.si;
+  int get di => session.cpu.di;
+  int get sp => session.cpu.sp;
+  int get bp => session.cpu.bp;
+  int get ip => session.cpu.ip;
+  int get cs => session.cpu.cs;
+  int get ds => session.cpu.ds;
+  int get ss => session.cpu.ss;
+  int get es => session.cpu.es;
+
+  bool get cf => session.cpu.cf;
+  bool get zf => session.cpu.zf;
+  bool get sf => session.cpu.sf;
+  bool get of => session.cpu.of;
+  bool get pf => session.cpu.pf;
+  bool get af => session.cpu.af;
+  bool get df => session.cpu.df;
+  bool get tf => session.cpu.tf;
+
+  bool get halted => session.cpu.halted;
+
+  // ---- Primary input handler -----------------------------------------------
+  //
+  // Returns List<String> — callers do:
+  //   for (final line in interpreter.handleLine(input)) { ... }
+
+  List<String> handleLine(String input) {
+    switch (_mode) {
+      case DebugMode.assembling:
+        return _handleAssembleLine(input);
+      case DebugMode.register:
+        return _handleRegisterValue(input);
+      case DebugMode.flags:
+        return setFlagsValue(input); // returns List<String>
+      case DebugMode.command:
+        return _handleCommand(input);
+    }
   }
 
-  // ── Public entry point ────────────────────────────────────────────────────
-  /// Handle one line of input. Returns list of output lines to display.
-  List<String> handleLine(String line) {
-    line = line.trimRight();
+  // ---- Command mode --------------------------------------------------------
 
-    // Assemble mode: keep reading instructions
-    if (mode == DebugMode.assembling) {
-      return _handleAssembleLine(line);
-    }
-
-    if (_enterMode) {
-      return _handleEnterData(line);
-    }
-
-    if (line.isEmpty) return ['-'];
+  List<String> _handleCommand(String raw) {
+    final line = raw.trim();
+    if (line.isEmpty) return [];
 
     final cmd = line[0].toUpperCase();
-    final rest = line.length > 1 ? line.substring(1).trim() : '';
 
-    switch (cmd) {
-      case 'A': return _cmdAssemble(rest);
-      case 'D': return _cmdDump(rest);
-      case 'E': return _cmdEnter(rest);
-      case 'F': return _cmdFill(rest);
-      case 'G': return _cmdGo(rest);
-      case 'H': return _cmdHex(rest);
-      case 'I': return _cmdIn(rest);
-      case 'M': return _cmdMove(rest);
-      case 'N': return _cmdName(rest);
-      case 'O': return _cmdOut(rest);
-      case 'Q': return _cmdQuit();
-      case 'R': return _cmdRegister(rest);
-      case 'S': return _cmdSearch(rest);
-      case 'T': return _cmdTrace(rest);
-      case 'U': return _cmdUnassemble(rest);
-      case 'W': return ['Writing (simulated)...', '-'];
-      case 'L': return ['Loading (simulated)...', '-'];
-      case '?': return _cmdHelp();
-      default:
-        return ['^ Error: Unrecognized command', '-'];
+    // Q — quit (caller checks mode or output for sentinel)
+    if (cmd == 'Q') {
+      return ['__QUIT__']; // sentinel: debug_state.dart can check for this
     }
+
+    // A — enter assembling mode
+    if (cmd == 'A') {
+      final result = session.run(line);
+      if (result.lines.isNotEmpty) {
+        _assembleAddr = _parseAddrFromPrompt(result.lines.first);
+      }
+      _mode = DebugMode.assembling;
+      return result.lines;
+    }
+
+    // R — register sub-commands
+    if (cmd == 'R') {
+      final rest =
+          line.length > 1 ? line.substring(1).trim().toUpperCase() : '';
+      if (rest.isEmpty) {
+        return session.run('R').lines;
+      }
+      if (rest == 'F') {
+        _mode = DebugMode.flags;
+        return [session.cpu.flagsDisplay()];
+      }
+      // R <regname> — show value then enter register-edit mode
+      try {
+        final val = session.cpu.getReg16(rest);
+        _pendingReg = rest;
+        _mode = DebugMode.register;
+        final h4 = val.toRadixString(16).toUpperCase().padLeft(4, '0');
+        return ['$rest  $h4'];
+      } catch (_) {
+        return ['Error: unknown register $rest'];
+      }
+    }
+
+    // All other commands
+    final result = session.run(line);
+    _mode = DebugMode.command;
+    return result.lines;
   }
 
-  // ── A — Assemble ──────────────────────────────────────────────────────────
-  List<String> _cmdAssemble(String rest) {
-    _assembleAddr = rest.isEmpty ? cpu.ip : _parseHex(rest);
-    mode = DebugMode.assembling;
-    return [_fmtAddr(_assembleAddr)]; // prompt for first instruction
-  }
+  // ---- Assembling mode -----------------------------------------------------
 
   List<String> _handleAssembleLine(String line) {
     if (line.trim().isEmpty) {
-      // Empty line exits assemble mode
-      mode = DebugMode.normal;
-      return ['-'];
+      _mode = DebugMode.command;
+      return [];
     }
-
-    final result = _asm.assemble(line, _assembleAddr);
-    if (!result.ok) {
-      return ['^ Error: ${result.error}', _fmtAddr(_assembleAddr)];
-    }
-    if (result.bytes.isEmpty) {
-      return [_fmtAddr(_assembleAddr)];
-    }
-
-    // Write bytes into memory
-    for (int i = 0; i < result.bytes.length; i++) {
-      cpu.writeByte((_assembleAddr + i) & 0xFFFF, result.bytes[i]);
-    }
-    _assembleAddr = (_assembleAddr + result.bytes.length) & 0xFFFF;
-    return [_fmtAddr(_assembleAddr)]; // next prompt
-  }
-
-  // ── D — Dump memory ───────────────────────────────────────────────────────
-  List<String> _cmdDump(String rest) {
-    int start, end;
-    final parts = rest.split(RegExp(r'[\s,L]+'));
-    final nonEmpty = parts.where((s) => s.isNotEmpty).toList();
-
-    if (nonEmpty.isEmpty) {
-      start = _lastDumpAddr;
-      end = (start + 0x7F) & 0xFFFF;
-    } else if (nonEmpty.length == 1) {
-      start = _parseHex(nonEmpty[0]);
-      end = (start + 0x7F) & 0xFFFF;
-    } else {
-      start = _parseHex(nonEmpty[0]);
-      // second arg could be end address or "L count"
-      if (rest.toUpperCase().contains('L')) {
-        end = (start + _parseHex(nonEmpty[1]) - 1) & 0xFFFF;
-      } else {
-        end = _parseHex(nonEmpty[1]);
-      }
-    }
-
-    _lastDumpAddr = (end + 1) & 0xFFFF;
-    final lines = <String>[];
-
-    int addr = start & 0xFFF0; // align to 16
-    // but start dump at [start]
-    addr = start;
-
-    while (addr <= end && addr <= 0xFFFF) {
-      final row = <int>[];
-      final rowStart = addr;
-      for (int i = 0; i < 16 && addr <= end && addr <= 0xFFFF; i++) {
-        row.add(cpu.readByte(addr++));
-      }
-
-      final hexPart = row
-          .map((b) => b.toRadixString(16).toUpperCase().padLeft(2, '0'))
-          .join(' ');
-
-      // Pad hex if last row is short
-      final padding = (16 - row.length) * 3;
-      final asciiPart = row.map((b) => (b >= 0x20 && b < 0x7F) ? String.fromCharCode(b) : '.').join();
-
-      lines.add(
-        '${_h4(rowStart)}  ${hexPart.padRight(47 + padding)}  $asciiPart',
-      );
-    }
-
-    lines.add('-');
-    return lines;
-  }
-
-  // ── E — Enter/Edit bytes ──────────────────────────────────────────────────
-  List<String> _cmdEnter(String rest) {
-    final parts = rest.trim().split(RegExp(r'\s+'));
-    if (parts.isEmpty || parts[0].isEmpty) {
-      return ['^ Usage: E address [bytes]', '-'];
-    }
-
-    _enterAddr = _parseHex(parts[0]);
-
-    // If more args, treat as inline byte list
-    if (parts.length > 1) {
-      final values = parts.sublist(1);
-      final output = <String>[];
-      for (final v in values) {
-        if (v.isEmpty) continue;
-        if (v.startsWith('"') || v.startsWith("'")) {
-          // string literal
-          for (final ch in v.replaceAll('"', '').replaceAll("'", '').codeUnits) {
-            cpu.writeByte(_enterAddr, ch);
-            _enterAddr = (_enterAddr + 1) & 0xFFFF;
-          }
-        } else {
-          final b = _parseHex(v) & 0xFF;
-          cpu.writeByte(_enterAddr, b);
-          _enterAddr = (_enterAddr + 1) & 0xFFFF;
-        }
-      }
-      output.add('-');
-      return output;
-    }
-
-    // Interactive mode — show current byte, await replacement
-    _enterMode = true;
-    final cur = cpu.readByte(_enterAddr);
-    return ['${_h4(_enterAddr)}  ${_h2(cur)}.'];
-  }
-
-  List<String> _handleEnterData(String line) {
-    line = line.trim();
-
-    if (line == '-' || line.isEmpty) {
-      // Done entering
-      _enterMode = false;
-      return ['-'];
-    }
-
-    // Replace current byte
-    if (line != '.') {
-      try {
-        final b = _parseHex(line) & 0xFF;
-        cpu.writeByte(_enterAddr, b);
-      } catch (_) {
-        return ['^ Error: invalid hex byte', '${_h4(_enterAddr)}  ${_h2(cpu.readByte(_enterAddr))}.'];
-      }
-    }
-
-    _enterAddr = (_enterAddr + 1) & 0xFFFF;
-    final cur = cpu.readByte(_enterAddr);
-    return ['${_h4(_enterAddr)}  ${_h2(cur)}.'];
-  }
-
-  // ── F — Fill ──────────────────────────────────────────────────────────────
-  List<String> _cmdFill(String rest) {
-    try {
-      final parts = rest.trim().split(RegExp(r'\s+'));
-      final start = _parseHex(parts[0]);
-      final end   = _parseHex(parts[1]);
-      final fillBytes = parts.sublist(2).map((s) => _parseHex(s) & 0xFF).toList();
-      if (fillBytes.isEmpty) return ['^ F: no fill value', '-'];
-      int fi = 0;
-      for (int a = start; a <= end; a++) {
-        cpu.writeByte(a, fillBytes[fi % fillBytes.length]);
-        fi++;
-      }
-      return ['-'];
-    } catch (e) {
-      return ['^ F: ${e}', '-'];
-    }
-  }
-
-  // ── G — Go (run) ─────────────────────────────────────────────────────────
-  List<String> _cmdGo(String rest) {
-    final out = <String>[];
-    cpu.halted = false;
-
-    int? breakAt;
-    if (rest.isNotEmpty) {
-      final parts = rest.trim().split(RegExp(r'\s+'));
-      if (parts[0].startsWith('=')) {
-        cpu.ip = _parseHex(parts[0].substring(1));
-        if (parts.length > 1) breakAt = _parseHex(parts[1]);
-      } else {
-        breakAt = _parseHex(parts[0]);
-      }
-    }
-
-    final result = _exec.run(breakAt: breakAt);
-
-    // Flush output log
-    for (final s in cpu.outputLog) out.add(s);
-    cpu.outputLog.clear();
-
+    final result = session.assembleAt(_assembleAddr, line.trim());
     if (result.error != null) {
-      out.add('Runtime error: ${result.error}');
+      return ['^ ${result.error}', _asmPrompt(_assembleAddr)];
     }
-
-    out.addAll(_formatRegisters());
-    out.add(_formatCurrentInstruction());
-    out.add('-');
-    return out;
+    _assembleAddr = result.next!;
+    return [];
   }
 
-  // ── H — Hex arithmetic ────────────────────────────────────────────────────
-  List<String> _cmdHex(String rest) {
+  // ---- Register-value mode -------------------------------------------------
+
+  List<String> _handleRegisterValue(String raw) {
+    _mode = DebugMode.command;
+    final input = raw.trim();
+    if (input.isEmpty) return [];
+    final value = int.tryParse(input, radix: 16);
+    if (value == null) return ['Error: invalid hex value'];
     try {
-      final parts = rest.trim().split(RegExp(r'\s+'));
-      final a = _parseHex(parts[0]);
-      final b = _parseHex(parts[1]);
-      final sum  = (a + b) & 0xFFFF;
-      final diff = (a - b) & 0xFFFF;
-      return ['${_h4(sum)}  ${_h4(diff)}', '-'];
-    } catch (_) {
-      return ['^ H: Usage: H value1 value2', '-'];
-    }
-  }
-
-  // ── I — Input port ────────────────────────────────────────────────────────
-  List<String> _cmdIn(String rest) {
-    return ['00', '-']; // Always return 0 (simulated)
-  }
-
-  // ── M — Move (copy) memory ────────────────────────────────────────────────
-  List<String> _cmdMove(String rest) {
-    try {
-      final parts = rest.trim().split(RegExp(r'\s+'));
-      final start = _parseHex(parts[0]);
-      final end   = _parseHex(parts[1]);
-      final dest  = _parseHex(parts[2]);
-      for (int i = 0; i <= end - start; i++) {
-        cpu.writeByte((dest + i) & 0xFFFF, cpu.readByte((start + i) & 0xFFFF));
-      }
-      return ['-'];
+      _applyRegister(_pendingReg, value);
+      return [];
     } catch (e) {
-      return ['^ M: ${e}', '-'];
+      return ['Error: $e'];
     }
   }
 
-  // ── N — Name (filename) ───────────────────────────────────────────────────
-  List<String> _cmdName(String rest) {
-    return ['-']; // Simulated — no filesystem
-  }
-
-  // ── O — Output port ───────────────────────────────────────────────────────
-  List<String> _cmdOut(String rest) {
-    return ['-']; // Simulated
-  }
-
-  // ── Q — Quit ──────────────────────────────────────────────────────────────
-  List<String> _cmdQuit() {
-    return ['__QUIT__'];
-  }
-
-  // ── R — Registers ────────────────────────────────────────────────────────
-  List<String> _cmdRegister(String rest) {
-    rest = rest.trim().toUpperCase();
-    final out = <String>[];
-
-    if (rest.isEmpty) {
-      // Display all registers
-      out.addAll(_formatRegisters());
-      out.add(_formatCurrentInstruction());
-      out.add('-');
-      return out;
-    }
-
-    // Modify a single register
-    try {
-      final current = cpu.getReg(rest);
-      final is8bit = cpu.is8BitReg(rest);
-      out.add('$rest  ${is8bit ? _h2(current) : _h4(current)}');
-      // Return a special token so the UI can prompt for new value
-      out.add('__REGPROMPT__:$rest');
-      return out;
-    } catch (_) {
-      if (rest == 'F') {
-        // Show/modify flags
-        out.add(_formatFlags());
-        out.add('__FLAGPROMPT__');
-        return out;
-      }
-      return ['^ R: Unknown register $rest', '-'];
-    }
-  }
-
-  /// Called after user enters new register value
-  List<String> setRegisterValue(String regName, String valueStr) {
-    try {
-      final v = _parseHex(valueStr.trim());
-      cpu.setReg(regName, v);
-      return ['-'];
-    } catch (_) {
-      return ['^ Invalid value', '-'];
-    }
-  }
-
-  /// Called after user enters new flags string (e.g. "NV UP EI NG NZ AC PE NC")
-  List<String> setFlagsValue(String flagStr) {
-    final tokens = flagStr.trim().toUpperCase().split(RegExp(r'\s+'));
-    for (final t in tokens) {
-      switch (t) {
-        case 'OV': cpu.of_ = true; break;
-        case 'NV': cpu.of_ = false; break;
-        case 'DN': cpu.df = true; break;
-        case 'UP': cpu.df = false; break;
-        case 'EI': cpu.ifl = true; break;
-        case 'DI': cpu.ifl = false; break;
-        case 'NG': cpu.sf = true; break;
-        case 'PL': cpu.sf = false; break;
-        case 'ZR': cpu.zf = true; break;
-        case 'NZ': cpu.zf = false; break;
-        case 'AC': cpu.af = true; break;
-        case 'NA': cpu.af = false; break;
-        case 'PE': cpu.pf = true; break;
-        case 'PO': cpu.pf = false; break;
-        case 'CY': cpu.cf = true; break;
-        case 'NC': cpu.cf = false; break;
-      }
-    }
-    return ['-'];
-  }
-
-  // ── S — Search ────────────────────────────────────────────────────────────
-  List<String> _cmdSearch(String rest) {
-    try {
-      final parts = rest.trim().split(RegExp(r'\s+'));
-      final start = _parseHex(parts[0]);
-      final end   = _parseHex(parts[1]);
-      final pattern = parts.sublist(2).map((s) => _parseHex(s) & 0xFF).toList();
-      final found = <String>[];
-      for (int a = start; a <= end - pattern.length + 1; a++) {
-        bool match = true;
-        for (int i = 0; i < pattern.length; i++) {
-          if (cpu.readByte(a + i) != pattern[i]) { match = false; break; }
-        }
-        if (match) found.add(_h4(a));
-      }
-      if (found.isEmpty) found.add('(no match)');
-      found.add('-');
-      return found;
-    } catch (e) {
-      return ['^ S: $e', '-'];
-    }
-  }
-
-  // ── T — Trace (single step) ──────────────────────────────────────────────
-  List<String> _cmdTrace(String rest) {
-    rest = rest.trim();
-    int count = 1;
-    if (rest.isNotEmpty) {
-      if (rest.startsWith('=')) {
-        final parts = rest.substring(1).split(RegExp(r'\s+'));
-        cpu.ip = _parseHex(parts[0]);
-        if (parts.length > 1) count = _parseHex(parts[1]);
-      } else {
-        count = _parseHex(rest);
-      }
-    }
-
-    cpu.halted = false;
-    final out = <String>[];
-
-    for (int i = 0; i < count; i++) {
-      final result = _exec.stepOne();
-      for (final s in cpu.outputLog) out.add(s);
-      cpu.outputLog.clear();
-      if (result.error != null) out.add('Error: ${result.error}');
-      if (result.halted) break;
-    }
-
-    out.addAll(_formatRegisters());
-    out.add(_formatCurrentInstruction());
-    out.add('-');
-    return out;
-  }
-
-  // ── U — Unassemble ───────────────────────────────────────────────────────
-  List<String> _cmdUnassemble(String rest) {
-    int start, count = 20;
-    final parts = rest.trim().split(RegExp(r'[\s,]+'));
-    final nonEmpty = parts.where((s) => s.isNotEmpty).toList();
-
-    if (nonEmpty.isEmpty) {
-      start = _lastDisasmAddr;
+  void _applyRegister(String name, int value) {
+    const regs8 = ['AL', 'AH', 'BL', 'BH', 'CL', 'CH', 'DL', 'DH'];
+    if (regs8.contains(name)) {
+      session.cpu.setReg8(name, value & 0xFF);
     } else {
-      start = _parseHex(nonEmpty[0]);
-      if (nonEmpty.length > 1) {
-        // could be end address or L count
-        if (rest.toUpperCase().contains('L')) {
-          count = _parseHex(nonEmpty[1]);
-        } else {
-          // end address — calculate how many instructions roughly
-          final endAddr = _parseHex(nonEmpty[1]);
-          count = ((endAddr - start) ~/ 2).clamp(1, 256);
-        }
+      session.cpu.setReg16(name, value & 0xFFFF);
+    }
+  }
+
+  // ---- Register set (called directly by debug_state.dart) -----------------
+  //
+  // setRegisterValue(String name, String hexValue) -> List<String>
+  // debug_state.dart iterates the result:
+  //   for (final line in interpreter.setRegisterValue(name, hexStr)) { … }
+
+  List<String> setRegisterValue(String name, String hexValue) {
+    final n = name.trim().toUpperCase();
+    final value = int.tryParse(hexValue.trim(), radix: 16);
+    if (value == null) {
+      return ['Error: invalid hex value "${hexValue.trim()}"'];
+    }
+    try {
+      _applyRegister(n, value);
+      return [];
+    } catch (e) {
+      return ['Error: $e'];
+    }
+  }
+
+  /// Convenience overload when the caller already has an int.
+  void setRegister(String name, int value) => _applyRegister(
+        name.trim().toUpperCase(),
+        value,
+      );
+
+  void setRegister8(String name, int value) =>
+      session.cpu.setReg8(name.trim().toUpperCase(), value & 0xFF);
+
+  int getRegister(String name) =>
+      session.cpu.getReg16(name.trim().toUpperCase());
+
+  // ---- Flags set -----------------------------------------------------------
+  //
+  // setFlagsValue(String) -> List<String>
+  // debug_state.dart iterates the result:
+  //   for (final line in interpreter.setFlagsValue(flagStr)) { … }
+  //
+  // Parses DEBUG.EXE flag mnemonic pairs (space-separated).
+  // Each token either sets or clears the corresponding flag:
+  //   OV/NV  DN/UP  EI/DI  NG/PL  ZR/NZ  AC/NA  PE/PO  CY/NC
+
+  List<String> setFlagsValue(String flagString) {
+    _mode = DebugMode.command;
+    final tokens = flagString.trim().toUpperCase().split(RegExp(r'\s+'));
+    for (final tok in tokens) {
+      switch (tok) {
+        case 'OV':
+          session.cpu.of = true;
+          break;
+        case 'NV':
+          session.cpu.of = false;
+          break;
+        case 'DN':
+          session.cpu.df = true;
+          break;
+        case 'UP':
+          session.cpu.df = false;
+          break;
+        case 'EI':
+          session.cpu.ifl = true;
+          break;
+        case 'DI':
+          session.cpu.ifl = false;
+          break;
+        case 'NG':
+          session.cpu.sf = true;
+          break;
+        case 'PL':
+          session.cpu.sf = false;
+          break;
+        case 'ZR':
+          session.cpu.zf = true;
+          break;
+        case 'NZ':
+          session.cpu.zf = false;
+          break;
+        case 'AC':
+          session.cpu.af = true;
+          break;
+        case 'NA':
+          session.cpu.af = false;
+          break;
+        case 'PE':
+          session.cpu.pf = true;
+          break;
+        case 'PO':
+          session.cpu.pf = false;
+          break;
+        case 'CY':
+          session.cpu.cf = true;
+          break;
+        case 'NC':
+          session.cpu.cf = false;
+          break;
       }
     }
+    return []; // no output lines; caller iterates this safely
+  }
 
-    final results = _dis.disasmN(start, count);
-    final lines = results.map((r) {
-      final bytes = r.hexBytes.padRight(14);
-      return '${_h4(r.address)}  $bytes  ${r.mnemonic}';
-    }).toList();
+  // ---- High-level command aliases -----------------------------------------
 
-    if (results.isNotEmpty) {
-      _lastDisasmAddr = results.last.nextAddress;
+  List<String> runCommand(String command) => session.run(command).lines;
+
+  bool isQuitCommand(String command) => command.trim().toUpperCase() == 'Q';
+
+  List<String> trace([int count = 1]) =>
+      session.run('T ${count.toRadixString(16).toUpperCase()}').lines;
+
+  List<String> proceed([int count = 1]) =>
+      session.run('P ${count.toRadixString(16).toUpperCase()}').lines;
+
+  List<String> go([String? breakAt]) {
+    final arg = breakAt != null ? '=$breakAt' : '';
+    return session.run('G $arg'.trim()).lines;
+  }
+
+  // ---- Assemble helpers ---------------------------------------------------
+
+  String beginAssemble([String? addressArg]) {
+    final arg = addressArg ?? '';
+    final lines = session.run('A $arg'.trim()).lines;
+    if (lines.isNotEmpty) {
+      _assembleAddr = _parseAddrFromPrompt(lines.first);
+      _mode = DebugMode.assembling;
     }
-
-    lines.add('-');
-    return lines;
+    return lines.isNotEmpty ? lines.first : '';
   }
 
-  // ── Help ──────────────────────────────────────────────────────────────────
-  List<String> _cmdHelp() {
-    return [
-      '',
-      'DEBUG.EXE Commands:',
-      '  A [addr]              Assemble instructions at address',
-      '  D [start] [end/L n]   Dump memory (hex + ASCII)',
-      '  E addr [bytes]        Enter/edit bytes at address',
-      '  F start end byte      Fill memory range with byte',
-      '  G [=addr] [break]     Go (run); optional start/breakpoint',
-      '  H val1 val2           Hex arithmetic (sum and difference)',
-      '  I port                Input from port (returns 0)',
-      '  M start end dest      Move (copy) memory block',
-      '  N filename            Name file (simulated)',
-      '  O port byte           Output to port (no-op)',
-      '  Q                     Quit DEBUG',
-      '  R [reg]               Display/modify registers',
-      '  S start end bytes     Search memory for byte pattern',
-      '  T [=addr] [count]     Trace (single-step) instructions',
-      '  U [addr] [end/L n]    Unassemble (disassemble) code',
-      '',
-      '-',
-    ];
+  ({int? next, String? error}) assembleInstruction(int addr, String line) =>
+      session.assembleAt(addr, line);
+
+  // ---- Memory operations --------------------------------------------------
+
+  List<int> readMemory(int addr, int count) => List<int>.generate(
+        count,
+        (i) => session.cpu.readByteLin((addr + i) & 0xFFFFF),
+      );
+
+  void writeMemory(int addr, List<int> bytes) {
+    for (int i = 0; i < bytes.length; i++) {
+      session.cpu.writeByteLin((addr + i) & 0xFFFFF, bytes[i]);
+    }
   }
 
-  // ── Register display ─────────────────────────────────────────────────────
-  List<String> _formatRegisters() {
-    return [
-      'AX=${_h4(cpu.ax)}  BX=${_h4(cpu.bx)}  CX=${_h4(cpu.cx)}  DX=${_h4(cpu.dx)}  '
-      'SP=${_h4(cpu.sp)}  BP=${_h4(cpu.bp)}  SI=${_h4(cpu.si)}  DI=${_h4(cpu.di)}',
-      'DS=${_h4(cpu.ds)}  ES=${_h4(cpu.es)}  SS=${_h4(cpu.ss)}  CS=${_h4(cpu.cs)}  '
-      'IP=${_h4(cpu.ip)}   ${_formatFlags()}',
-    ];
+  List<String> dumpMemory([String range = '']) =>
+      session.run('D $range'.trim()).lines;
+
+  List<String> unassemble([String range = '']) =>
+      session.run('U $range'.trim()).lines;
+
+  // ---- Register display ---------------------------------------------------
+
+  String registerDump() {
+    final c = session.cpu;
+    String h4(int v) => v.toRadixString(16).toUpperCase().padLeft(4, '0');
+    final l1 = 'AX=${h4(c.ax)}  BX=${h4(c.bx)}  CX=${h4(c.cx)}  DX=${h4(c.dx)}'
+        '  SP=${h4(c.sp)}  BP=${h4(c.bp)}  SI=${h4(c.si)}  DI=${h4(c.di)}';
+    final l2 = 'DS=${h4(c.ds)}  ES=${h4(c.es)}  SS=${h4(c.ss)}  CS=${h4(c.cs)}'
+        '  IP=${h4(c.ip)}   ${c.flagsDisplay()}';
+    return '$l1\n$l2';
   }
 
-  String _formatFlags() {
-    return [
-      cpu.of_ ? 'OV' : 'NV',
-      cpu.df  ? 'DN' : 'UP',
-      cpu.ifl ? 'EI' : 'DI',
-      cpu.sf  ? 'NG' : 'PL',
-      cpu.zf  ? 'ZR' : 'NZ',
-      cpu.af  ? 'AC' : 'NA',
-      cpu.pf  ? 'PE' : 'PO',
-      cpu.cf  ? 'CY' : 'NC',
-    ].join(' ');
+  // ---- Reset --------------------------------------------------------------
+
+  void reset() {
+    session.cpu.reset();
+    session.cpu.cs = 0x0800;
+    session.cpu.ds = 0x0800;
+    session.cpu.es = 0x0800;
+    session.cpu.ss = 0x0800;
+    session.cpu.ip = 0x0100;
+    session.cpu.sp = 0xFFFE;
+    _mode = DebugMode.command;
+    _assembleAddr = 0;
+    _pendingReg = '';
   }
 
-  String _formatCurrentInstruction() {
-    final d = _dis.disasm(cpu.ip);
-    final bytes = d.hexBytes.padRight(14);
-    return '${_h4(cpu.cs)}:${_h4(cpu.ip)}  $bytes  ${d.mnemonic}';
+  // ---- Private helpers ----------------------------------------------------
+
+  int _parseAddrFromPrompt(String prompt) {
+    final m = RegExp(r'([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})').firstMatch(prompt);
+    if (m == null) return session.cpu.csip();
+    final seg = int.parse(m.group(1)!, radix: 16);
+    final off = int.parse(m.group(2)!, radix: 16);
+    return DbgCpu.linear(seg, off);
   }
 
-  // ── Formatting helpers ────────────────────────────────────────────────────
-  String _h2(int v) => (v & 0xFF).toRadixString(16).toUpperCase().padLeft(2, '0');
-  String _h4(int v) => (v & 0xFFFF).toRadixString(16).toUpperCase().padLeft(4, '0');
-  String _fmtAddr(int addr) => '${_h4(cpu.cs)}:${_h4(addr)}';
-
-  int _parseHex(String s) {
-    s = s.trim().toUpperCase();
-    if (s.endsWith('H')) s = s.substring(0, s.length - 1);
-    if (s.startsWith('0X')) s = s.substring(2);
-    return int.parse(s, radix: 16);
+  String _asmPrompt(int linearAddr) {
+    String h4(int v) => v.toRadixString(16).toUpperCase().padLeft(4, '0');
+    final seg = linearAddr >> 4;
+    final off = linearAddr & 0xFFFF;
+    return '${h4(seg)}:${h4(off)}';
   }
 }

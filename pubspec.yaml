@@ -1,5 +1,5 @@
-name: debug_exe_flutter
-description: DOS DEBUG.EXE emulator in Flutter — 8086 machine code debugger
+name: asm8086_ide
+description: 8086 Assembly IDE with TASM-compatible assembler and debugger
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -11,6 +11,13 @@ dependencies:
   flutter:
     sdk: flutter
   provider: ^6.1.1
+  shared_preferences: ^2.2.2
+  file_picker: ^8.1.5
+  path_provider: ^2.1.2
+  google_fonts: ^6.1.0
+  highlight: ^0.7.0
+  flutter_highlight: ^0.7.0
+  intl: ^0.19.0
 
 dev_dependencies:
   flutter_test:

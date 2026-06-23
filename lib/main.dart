@@ -1,34 +1,53 @@
 // lib/main.dart
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import 'core/debug_state.dart';
-import 'ui/debug_screen.dart';
+import 'core/app_state.dart';
+import 'ui/main_screen.dart';
 
 void main() {
-  runApp(const DebugApp());
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.light,
+    systemNavigationBarColor: Color(0xFF0D1117),
+  ));
+  runApp(const App8086());
 }
 
-class DebugApp extends StatelessWidget {
-  const DebugApp({super.key});
+class App8086 extends StatelessWidget {
+  const App8086({super.key});
 
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
-      create: (_) => DebugState(),
+      create: (_) => AppState(),
       child: MaterialApp(
-        title: 'DEBUG.EXE',
+        title: '8086 ASM IDE',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData.dark().copyWith(
-          scaffoldBackgroundColor: const Color(0xFF0A0F0A),
-          colorScheme: ColorScheme.dark(
-            primary: const Color(0xFF33FF33),
-            surface: const Color(0xFF0A0F0A),
+        theme: ThemeData(
+          colorScheme: const ColorScheme.dark(
+            primary: Color(0xFF58A6FF),
+            secondary: Color(0xFF3FB950),
+            surface: Color(0xFF161B22),
+            error: Color(0xFFFF7B72),
           ),
-          textTheme: ThemeData.dark().textTheme.apply(
-            fontFamily: 'monospace',
+          scaffoldBackgroundColor: const Color(0xFF0D1117),
+          fontFamily: 'monospace',
+          appBarTheme: const AppBarTheme(
+            backgroundColor: Color(0xFF161B22),
+            foregroundColor: Color(0xFFE6EDF3),
+            elevation: 0,
           ),
+          dividerColor: const Color(0xFF21262D),
+          useMaterial3: true,
         ),
-        home: const DebugScreen(),
+        home: const MainScreen(),
       ),
     );
   }
